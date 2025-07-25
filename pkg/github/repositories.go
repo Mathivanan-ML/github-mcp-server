@@ -1391,3 +1391,405 @@ func resolveGitReference(ctx context.Context, githubClient *github.Client, owner
 	// Use provided ref, or it will be empty which defaults to the default branch
 	return &raw.ContentOpts{Ref: ref, SHA: sha}, nil
 }
+
+// AddCollaborator creates a tool to add a collaborator to a GitHub repository.
+func AddCollaborator(getClient GetClientFn, t translations.TranslationHelperFunc) (tool mcp.Tool, handler server.ToolHandlerFunc) {
+	return mcp.NewTool("add_collaborator",
+			mcp.WithDescription(t("TOOL_ADD_COLLABORATOR_DESCRIPTION", "Add a collaborator to a GitHub repository with specified permissions")),
+			mcp.WithToolAnnotation(mcp.ToolAnnotation{
+				Title:        t("TOOL_ADD_COLLABORATOR_USER_TITLE", "Add repository collaborator"),
+				ReadOnlyHint: ToBoolPtr(false),
+			}),
+			mcp.WithString("owner",
+				mcp.Required(),
+				mcp.Description("Repository owner (username or organization)"),
+			),
+			mcp.WithString("repo",
+				mcp.Required(),
+				mcp.Description("Repository name"),
+			),
+			mcp.WithString("username",
+				mcp.Required(),
+				mcp.Description("Username of the collaborator to add"),
+			),
+			mcp.WithString("permission",
+				mcp.Description("Permission level for the collaborator. Can be 'pull' (read), 'push' (write), 'admin', 'maintain', or 'triage'. Defaults to 'push'."),
+				mcp.Enum("pull", "push", "admin", "maintain", "triage"),
+			),
+		),
+		func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			owner, err := RequiredParam[string](request, "owner")
+			if err != nil {
+				return mcp.NewToolResultError(err.Error()), nil
+			}
+			repo, err := RequiredParam[string](request, "repo")
+			if err != nil {
+				return mcp.NewToolResultError(err.Error()), nil
+			}
+			username, err := RequiredParam[string](request, "username")
+			if err != nil {
+				return mcp.NewToolResultError(err.Error()), nil
+			}
+
+			// Get permission level, default to "push" if not specified
+			permission, err := OptionalParam[string](request, "permission")
+			if err != nil {
+				return mcp.NewToolResultError(err.Error()), nil
+			}
+			if permission == "" {
+				permission = "push"
+			}
+
+			// Validate permission level
+			validPermissions := map[string]bool{
+				"pull":     true,
+				"push":     true,
+				"admin":    true,
+				"maintain": true,
+				"triage":   true,
+			}
+			if !validPermissions[permission] {
+				return mcp.NewToolResultError(fmt.Sprintf("invalid permission level: %s. Must be one of: pull, push, admin, maintain, triage", permission)), nil
+			}
+
+			client, err := getClient(ctx)
+			if err != nil {
+				return nil, fmt.Errorf("failed to get GitHub client: %w", err)
+			}
+
+			// Create the repository collaborator options
+			opts := &github.RepositoryAddCollaboratorOptions{
+				Permission: permission,
+			}
+
+			// Add the collaborator to the repository
+			invitation, resp, err := client.Repositories.AddCollaborator(ctx, owner, repo, username, opts)
+			if err != nil {
+				return ghErrors.NewGitHubAPIErrorResponse(ctx,
+					fmt.Sprintf("failed to add collaborator '%s' to repository '%s/%s'", username, owner, repo),
+					resp,
+					err,
+				), nil
+			}
+			defer func() { _ = resp.Body.Close() }()
+
+			// Check response status codes
+			if resp.StatusCode != 201 && resp.StatusCode != 204 {
+				body, err := io.ReadAll(resp.Body)
+				if err != nil {
+					return nil, fmt.Errorf("failed to read response body: %w", err)
+				}
+				return mcp.NewToolResultError(fmt.Sprintf("failed to add collaborator: %s", string(body))), nil
+			}
+
+			// Prepare response based on status code
+			var response interface{}
+
+			if resp.StatusCode == 201 && invitation != nil {
+				// User was invited (not already a collaborator)
+				response = map[string]interface{}{
+					"status":     "invited",
+					"message":    fmt.Sprintf("Successfully invited %s as a collaborator to %s/%s with %s permissions", username, owner, repo, permission),
+					"invitation": invitation,
+				}
+			} else if resp.StatusCode == 204 {
+				// User was already a collaborator, permissions updated
+				response = map[string]interface{}{
+					"status":  "updated",
+					"message": fmt.Sprintf("Successfully updated %s's permissions to %s for repository %s/%s", username, permission, owner, repo),
+				}
+			}
+
+			r, err := json.Marshal(response)
+			if err != nil {
+				return nil, fmt.Errorf("failed to marshal response: %w", err)
+			}
+
+			return mcp.NewToolResultText(string(r)), nil
+		}
+}
+
+func RemoveCollaborator(getClient GetClientFn, t translations.TranslationHelperFunc) (tool mcp.Tool, handler server.ToolHandlerFunc) {
+	return mcp.NewTool("remove_collaborator",
+			mcp.WithDescription(t("TOOL_REMOVE_COLLABORATOR_DESCRIPTION", "Remove a collaborator from a GitHub repository")),
+			mcp.WithToolAnnotation(mcp.ToolAnnotation{
+				Title:        t("TOOL_REMOVE_COLLABORATOR_USER_TITLE", "Remove repository collaborator"),
+				ReadOnlyHint: ToBoolPtr(false),
+			}),
+			mcp.WithString("owner",
+				mcp.Required(),
+				mcp.Description("Repository owner (username or organization)"),
+			),
+			mcp.WithString("repo",
+				mcp.Required(),
+				mcp.Description("Repository name"),
+			),
+			mcp.WithString("username",
+				mcp.Required(),
+				mcp.Description("Username of the collaborator to remove"),
+			),
+		),
+		func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			owner, err := RequiredParam[string](request, "owner")
+			if err != nil {
+				return mcp.NewToolResultError(err.Error()), nil
+			}
+			repo, err := RequiredParam[string](request, "repo")
+			if err != nil {
+				return mcp.NewToolResultError(err.Error()), nil
+			}
+			username, err := RequiredParam[string](request, "username")
+			if err != nil {
+				return mcp.NewToolResultError(err.Error()), nil
+			}
+
+			client, err := getClient(ctx)
+			if err != nil {
+				return nil, fmt.Errorf("failed to get GitHub client: %w", err)
+			}
+
+			// Remove the collaborator from the repository
+			resp, err := client.Repositories.RemoveCollaborator(ctx, owner, repo, username)
+			if err != nil {
+				return ghErrors.NewGitHubAPIErrorResponse(ctx,
+					fmt.Sprintf("failed to remove collaborator '%s' from repository '%s/%s'", username, owner, repo),
+					resp,
+					err,
+				), nil
+			}
+			defer func() { _ = resp.Body.Close() }()
+
+			// Check response status codes
+			if resp.StatusCode != 204 {
+				body, err := io.ReadAll(resp.Body)
+				if err != nil {
+					return nil, fmt.Errorf("failed to read response body: %w", err)
+				}
+				return mcp.NewToolResultError(fmt.Sprintf("failed to remove collaborator: %s", string(body))), nil
+			}
+
+			// Prepare success response
+			response := map[string]interface{}{
+				"status":  "removed",
+				"message": fmt.Sprintf("Successfully removed %s as a collaborator from %s/%s", username, owner, repo),
+			}
+
+			r, err := json.Marshal(response)
+			if err != nil {
+				return nil, fmt.Errorf("failed to marshal response: %w", err)
+			}
+
+			return mcp.NewToolResultText(string(r)), nil
+		}
+}
+
+// CancelInvitation cancels a pending repository invitation by invitation ID
+func CancelInvitation(getClient GetClientFn, t translations.TranslationHelperFunc) (tool mcp.Tool, handler server.ToolHandlerFunc) {
+	return mcp.NewTool("cancel_invitation",
+			mcp.WithDescription(t("TOOL_CANCEL_INVITATION_DESCRIPTION", "Cancel a pending repository invitation by invitation ID")),
+			mcp.WithToolAnnotation(mcp.ToolAnnotation{
+				Title:        t("TOOL_CANCEL_INVITATION_USER_TITLE", "Cancel repository invitation"),
+				ReadOnlyHint: ToBoolPtr(false),
+			}),
+			mcp.WithString("owner",
+				mcp.Required(),
+				mcp.Description("Repository owner (username or organization)"),
+			),
+			mcp.WithString("repo",
+				mcp.Required(),
+				mcp.Description("Repository name"),
+			),
+			mcp.WithNumber("invitation_id",
+				mcp.Required(),
+				mcp.Description("ID of the invitation to cancel"),
+			),
+		),
+		func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			owner, err := RequiredParam[string](request, "owner")
+			if err != nil {
+				return mcp.NewToolResultError(err.Error()), nil
+			}
+			repo, err := RequiredParam[string](request, "repo")
+			if err != nil {
+				return mcp.NewToolResultError(err.Error()), nil
+			}
+			invitationID, err := RequiredParam[float64](request, "invitation_id")
+			if err != nil {
+				return mcp.NewToolResultError(err.Error()), nil
+			}
+
+			client, err := getClient(ctx)
+			if err != nil {
+				return nil, fmt.Errorf("failed to get GitHub client: %w", err)
+			}
+
+			invitationIDInt := int64(invitationID)
+
+			// Cancel the invitation
+			resp, err := client.Repositories.DeleteInvitation(ctx, owner, repo, invitationIDInt)
+			if err != nil {
+				return ghErrors.NewGitHubAPIErrorResponse(ctx,
+					fmt.Sprintf("failed to cancel invitation %d for repository '%s/%s'", invitationIDInt, owner, repo),
+					resp,
+					err,
+				), nil
+			}
+			defer func() { _ = resp.Body.Close() }()
+
+			if resp.StatusCode != 204 {
+				body, err := io.ReadAll(resp.Body)
+				if err != nil {
+					return nil, fmt.Errorf("failed to read response body: %w", err)
+				}
+				return mcp.NewToolResultError(fmt.Sprintf("failed to cancel invitation: %s", string(body))), nil
+			}
+
+			// Prepare success response
+			response := map[string]interface{}{
+				"status":        "cancelled",
+				"invitation_id": invitationIDInt,
+				"message":       fmt.Sprintf("Successfully cancelled invitation %d for repository %s/%s", invitationIDInt, owner, repo),
+			}
+
+			r, err := json.Marshal(response)
+			if err != nil {
+				return nil, fmt.Errorf("failed to marshal response: %w", err)
+			}
+
+			return mcp.NewToolResultText(string(r)), nil
+		}
+}
+
+// ListCollaborators lists both active collaborators and pending invitations for a repository
+func ListCollaborators(getClient GetClientFn, t translations.TranslationHelperFunc) (tool mcp.Tool, handler server.ToolHandlerFunc) {
+	return mcp.NewTool("list_collaborators",
+			mcp.WithDescription(t("TOOL_LIST_COLLABORATORS_DESCRIPTION", "List both active collaborators and pending invitations for a repository")),
+			mcp.WithToolAnnotation(mcp.ToolAnnotation{
+				Title:        t("TOOL_LIST_COLLABORATORS_USER_TITLE", "List repository collaborators"),
+				ReadOnlyHint: ToBoolPtr(true),
+			}),
+			mcp.WithString("owner",
+				mcp.Required(),
+				mcp.Description("Repository owner (username or organization)"),
+			),
+			mcp.WithString("repo",
+				mcp.Required(),
+				mcp.Description("Repository name"),
+			),
+			WithPagination(),
+		),
+		func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			owner, err := RequiredParam[string](request, "owner")
+			if err != nil {
+				return mcp.NewToolResultError(err.Error()), nil
+			}
+			repo, err := RequiredParam[string](request, "repo")
+			if err != nil {
+				return mcp.NewToolResultError(err.Error()), nil
+			}
+			pagination, err := OptionalPaginationParams(request)
+			if err != nil {
+				return mcp.NewToolResultError(err.Error()), nil
+			}
+
+			client, err := getClient(ctx)
+			if err != nil {
+				return nil, fmt.Errorf("failed to get GitHub client: %w", err)
+			}
+
+			listOptions := &github.ListOptions{
+				Page:    pagination.Page,
+				PerPage: pagination.PerPage,
+			}
+
+			// List active collaborators
+			collaborators, resp, err := client.Repositories.ListCollaborators(ctx, owner, repo, &github.ListCollaboratorsOptions{
+				ListOptions: *listOptions,
+			})
+			if err != nil {
+				return ghErrors.NewGitHubAPIErrorResponse(ctx,
+					"failed to list collaborators",
+					resp,
+					err,
+				), nil
+			}
+			defer func() { _ = resp.Body.Close() }()
+
+			// List pending invitations
+			invitations, resp2, err := client.Repositories.ListInvitations(ctx, owner, repo, listOptions)
+			if err != nil {
+				// Don't fail if we can't get invitations, just return empty array
+				invitations = []*github.RepositoryInvitation{}
+			}
+			if resp2 != nil {
+				defer func() { _ = resp2.Body.Close() }()
+			}
+
+			// Prepare response
+			response := map[string]interface{}{
+				"repository": fmt.Sprintf("%s/%s", owner, repo),
+				"collaborators": map[string]interface{}{
+					"active":  make([]map[string]interface{}, 0),
+					"pending": make([]map[string]interface{}, 0),
+				},
+				"pagination": map[string]interface{}{
+					"page":     pagination.Page,
+					"per_page": pagination.PerPage,
+				},
+			}
+
+			activeCollaborators := make([]map[string]interface{}, 0)
+			pendingInvitations := make([]map[string]interface{}, 0)
+
+			// Add active collaborators
+			for _, collaborator := range collaborators {
+				activeCollaborators = append(activeCollaborators, map[string]interface{}{
+					"login":       collaborator.GetLogin(),
+					"id":          collaborator.GetID(),
+					"type":        "collaborator",
+					"permissions": collaborator.Permissions,
+					"html_url":    collaborator.GetHTMLURL(),
+				})
+			}
+
+			// Add pending invitations
+			for _, invitation := range invitations {
+				invitationData := map[string]interface{}{
+					"invitation_id": invitation.GetID(),
+					"type":          "invitation",
+					"permissions":   invitation.GetPermissions(),
+					"created_at":    invitation.GetCreatedAt().Format("2006-01-02T15:04:05Z"),
+				}
+
+				if invitation.Invitee != nil {
+					invitationData["login"] = invitation.Invitee.GetLogin()
+					invitationData["id"] = invitation.Invitee.GetID()
+					invitationData["html_url"] = invitation.Invitee.GetHTMLURL()
+				}
+
+				if invitation.Inviter != nil {
+					invitationData["inviter"] = invitation.Inviter.GetLogin()
+				}
+
+				pendingInvitations = append(pendingInvitations, invitationData)
+			}
+
+			// Update the response with the populated arrays
+			response["collaborators"].(map[string]interface{})["active"] = activeCollaborators
+			response["collaborators"].(map[string]interface{})["pending"] = pendingInvitations
+
+			// Add counts
+			response["counts"] = map[string]interface{}{
+				"active_collaborators": len(activeCollaborators),
+				"pending_invitations":  len(pendingInvitations),
+				"total":                len(activeCollaborators) + len(pendingInvitations),
+			}
+
+			r, err := json.Marshal(response)
+			if err != nil {
+				return nil, fmt.Errorf("failed to marshal response: %w", err)
+			}
+
+			return mcp.NewToolResultText(string(r)), nil
+		}
+}
